@@ -82,6 +82,8 @@ class RemoteAuth extends BaseAuthStrategy {
 
         this.userDataDir = dirPath;
         this.sessionName = sessionDirName;
+        this.destroyed = false;
+        this.sessionReady = false;
 
         await this.extractRemoteSession();
 
@@ -96,10 +98,23 @@ class RemoteAuth extends BaseAuthStrategy {
     }
 
     async destroy() {
+        this.destroyed = true;
         clearInterval(this.backupSync);
+        if (!this.sessionReady) return;
+
+        // The client closes the browser before calling this, so unlike the
+        // periodic backups (copied while Chrome writes) this copy is consistent
+        try {
+            if (this.storing) await this.storing.catch(() => {});
+            await this.storeRemoteSession();
+        } catch (err) {
+            console.error('RemoteAuth: final session backup failed:', err);
+        }
     }
 
     async disconnect() {
+        // The session is being wiped, so it must not be backed up again on destroy
+        this.sessionReady = false;
         await this.deleteRemoteSession();
 
         let pathExists = await this.isValidPath(this.userDataDir);
@@ -116,22 +131,50 @@ class RemoteAuth extends BaseAuthStrategy {
     }
 
     async afterAuthReady() {
-        const sessionExists = await this.store.sessionExists({
-            session: this.sessionName,
-        });
-        if (!sessionExists) {
-            await this.delay(
-                60000,
-            ); /* Initial delay sync required for session to be stable enough to recover */
-            await this.storeRemoteSession({ emit: true });
+        this.sessionReady = true;
+        try {
+            const sessionExists = await this.store.sessionExists({
+                session: this.sessionName,
+            });
+            if (!sessionExists) {
+                await this.delay(
+                    60000,
+                ); /* Initial delay sync required for session to be stable enough to recover */
+                if (this.destroyed) return;
+                await this.storeRemoteSession({ emit: true });
+            }
+        } finally {
+            // `ready` fires again every time WhatsApp Web reloads: replace the
+            // timer instead of stacking one more, and keep backing up even if
+            // the first save failed
+            if (!this.destroyed) {
+                clearInterval(this.backupSync);
+                this.backupSync = setInterval(() => {
+                    this.storeRemoteSession().catch((err) =>
+                        console.error(
+                            'RemoteAuth: session backup failed:',
+                            err,
+                        ),
+                    );
+                }, this.backupSyncIntervalMs);
+            }
         }
-        var self = this;
-        this.backupSync = setInterval(async function () {
-            await self.storeRemoteSession();
-        }, this.backupSyncIntervalMs);
     }
 
     async storeRemoteSession(options) {
+        // A slow store can make the timer fire before the previous backup ends;
+        // both would write the same temp dir and zip
+        if (this.storing) return this.storing;
+
+        this.storing = this.compressAndSaveSession(options);
+        try {
+            return await this.storing;
+        } finally {
+            this.storing = null;
+        }
+    }
+
+    async compressAndSaveSession(options) {
         const pathExists = await this.isValidPath(this.userDataDir);
         if (!pathExists) return;
 
