@@ -15,8 +15,6 @@ exports.DefaultOptions = {
     qrMaxRetries: 0,
     takeoverOnConflict: false,
     takeoverTimeoutMs: 0,
-    userAgent:
-        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_14_0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/101.0.4951.67 Safari/537.36',
     ffmpegPath: 'ffmpeg',
     bypassCSP: false,
     proxyAuthentication: undefined,
@@ -171,6 +169,19 @@ exports.WAState = {
     UNLAUNCHED: 'UNLAUNCHED',
     UNPAIRED: 'UNPAIRED',
     UNPAIRED_IDLE: 'UNPAIRED_IDLE',
+};
+
+/**
+ * Reasons, other than a WAState, for which the client emits `disconnected`
+ * @readonly
+ * @enum {string}
+ */
+exports.DisconnectReason = {
+    LOGOUT: 'LOGOUT',
+    MAX_QR_RETRIES: 'Max qrcode retries reached',
+    BROWSER_DISCONNECTED: 'BROWSER_DISCONNECTED',
+    PAGE_CRASHED: 'PAGE_CRASHED',
+    INJECTION_FAILED: 'INJECTION_FAILED',
 };
 
 /**

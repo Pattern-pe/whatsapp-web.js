@@ -10,6 +10,7 @@ const {
     DefaultOptions,
     Events,
     WAState,
+    DisconnectReason,
     MessageTypes,
 } = require('./util/Constants');
 const { LoadUtils } = require('./util/Injected/Utils');
@@ -36,6 +37,23 @@ const {
 const NoAuth = require('./authStrategies/NoAuth');
 const { exposeFunctionIfAbsent } = require('./util/Puppeteer');
 
+const NAVIGATION_TIMEOUT_MS = 120000;
+
+// Two instances sharing a session take it over from each other forever;
+// past this many takeovers in the window the client gives up instead.
+const MAX_TAKEOVERS = 3;
+const TAKEOVER_WINDOW_MS = 10 * 60 * 1000;
+
+// States that keep the client from loading at all, which the regular state
+// listener cannot report because it is only attached once the client is ready
+const BLOCKING_STATES = [
+    WAState.CONFLICT,
+    WAState.DEPRECATED_VERSION,
+    WAState.PROXYBLOCK,
+    WAState.SMB_TOS_BLOCK,
+    WAState.TOS_BLOCK,
+];
+
 /**
  * Starting point for interacting with the WhatsApp Web API
  * @extends {EventEmitter}
@@ -46,10 +64,10 @@ const { exposeFunctionIfAbsent } = require('./util/Puppeteer');
  * @param {number} options.authTimeoutMs - Timeout for authentication selector in puppeteer
  * @param {function} options.evalOnNewDoc - function to eval on new doc
  * @param {object} options.puppeteer - Puppeteer launch options. View docs here: https://github.com/puppeteer/puppeteer/
- * @param {number} options.qrMaxRetries - How many times should the qrcode be refreshed before giving up
- * @param {number} options.takeoverOnConflict - If another whatsapp web session is detected (another browser), take over the session in the current browser
+ * @param {number} options.qrMaxRetries - How many times should the qrcode (or pairing code) be refreshed before giving up
+ * @param {number} options.takeoverOnConflict - If another whatsapp web session is detected (another browser), take over the session in the current browser. Gives up and disconnects with CONFLICT after 3 takeovers in 10 minutes.
  * @param {number} options.takeoverTimeoutMs - How much time to wait before taking over the session
- * @param {string} options.userAgent - User agent to use in puppeteer
+ * @param {string|false} options.userAgent - User agent to use in puppeteer. Defaults to the one a regular Chrome of the launched version sends; false keeps the browser's own.
  * @param {string} options.ffmpegPath - Ffmpeg path to use when formatting videos to webp while sending stickers
  * @param {boolean} options.bypassCSP - Sets bypassing of page's Content-Security-Policy.
  * @param {string} options.deviceName - Sets the device name of a current linked device., i.e.: 'TEST'.
@@ -134,7 +152,6 @@ class Client extends EventEmitter {
                 this.options.browserName,
             );
             const pairWithPhoneNumber = this.options.pairWithPhoneNumber;
-            const version = await this.getWWebVersion();
 
             const needAuthHandle = await this.pupPage.waitForFunction(
                 () => {
@@ -153,9 +170,16 @@ class Client extends EventEmitter {
                         state,
                     };
                 },
-                { timeout: authTimeout },
+                { timeout: authTimeout, signal: abort.signal },
             );
             const needAuthentication = await needAuthHandle.jsonValue();
+
+            if (BLOCKING_STATES.includes(needAuthentication.state)) {
+                const disconnected = await this._handleConnectionState(
+                    needAuthentication.state,
+                );
+                if (disconnected) return;
+            }
 
             if (needAuthentication.need) {
                 const { failed, failureEventPayload, restart } =
@@ -181,18 +205,13 @@ class Client extends EventEmitter {
 
                 // Register qr/code events
                 if (pairWithPhoneNumber.phoneNumber) {
-                    this.requestPairingCode(
+                    // Awaited so a failure rejects inject() instead of becoming an unhandled rejection
+                    await this.requestPairingCode(
                         pairWithPhoneNumber.phoneNumber,
                         pairWithPhoneNumber.showNotification,
                         pairWithPhoneNumber.intervalMs,
                     );
                 } else {
-                    let qrRetries = 0;
-
-                    this.on(Events.LOADING_SCREEN, () => {
-                        qrRetries = 0;
-                    });
-
                     await exposeFunctionIfAbsent(
                         this.pupPage,
                         'onQRChangedEvent',
@@ -203,16 +222,7 @@ class Client extends EventEmitter {
                              * @param {string} qr QR Code
                              */
                             this.emit(Events.QR_RECEIVED, qr);
-                            if (this.options.qrMaxRetries > 0) {
-                                qrRetries++;
-                                if (qrRetries > this.options.qrMaxRetries) {
-                                    this.emit(
-                                        Events.DISCONNECTED,
-                                        'Max qrcode retries reached',
-                                    );
-                                    await this.destroy();
-                                }
-                            }
+                            await this._countQrRetry();
                         },
                     );
 
@@ -273,7 +283,7 @@ class Client extends EventEmitter {
             await exposeFunctionIfAbsent(
                 this.pupPage,
                 'onAuthAppStateChangedEvent',
-                async (state) => {
+                async (state, stateListenerAttached) => {
                     if (
                         state == 'UNPAIRED_IDLE' &&
                         !pairWithPhoneNumber.phoneNumber
@@ -282,6 +292,12 @@ class Client extends EventEmitter {
                         await this.pupPage.evaluate(() => {
                             window.require('WAWebCmd').Cmd.refreshQR();
                         });
+                    }
+                    if (
+                        !stateListenerAttached &&
+                        BLOCKING_STATES.includes(state)
+                    ) {
+                        await this._handleConnectionState(state);
                     }
                 },
             );
@@ -314,9 +330,10 @@ class Client extends EventEmitter {
                                 webCacheOptions,
                             );
 
+                            // Read now: WhatsApp Web may have updated itself since inject() started
                             await webCache.persist(
                                 this.currentIndexHtml,
-                                version,
+                                await this.getWWebVersion(),
                             );
                         }
 
@@ -363,7 +380,12 @@ class Client extends EventEmitter {
                      * @event Client#ready
                      */
                     this.emit(Events.READY);
-                    this.authStrategy.afterAuthReady();
+                    // Not awaited so it does not hold up the page, but a failure must not become an unhandled rejection
+                    Promise.resolve()
+                        .then(() => this.authStrategy.afterAuthReady())
+                        .catch((err) =>
+                            console.error('afterAuthReady failed:', err),
+                        );
                 },
             );
             let lastPercent = null;
@@ -373,6 +395,7 @@ class Client extends EventEmitter {
                 async (percent) => {
                     if (lastPercent !== percent) {
                         lastPercent = percent;
+                        this._qrRetries = 0;
                         this.emit(Events.LOADING_SCREEN, percent, 'WhatsApp'); // Message is hardcoded as "WhatsApp" for now
                     }
                 },
@@ -396,7 +419,10 @@ class Client extends EventEmitter {
                         Socket,
                         'change:state',
                         (_AppState, state) => {
-                            window.onAuthAppStateChangedEvent(state);
+                            window.onAuthAppStateChangedEvent(
+                                state,
+                                !!window._wwjsStateListenerAttached,
+                            );
                         },
                     ],
                     [
@@ -467,6 +493,9 @@ class Client extends EventEmitter {
      * Sets up events and requirements, kicks off authentication request
      */
     async initialize() {
+        // A disconnected listener may re-initialize while the previous teardown is still running
+        if (this._destroying) await this._destroying.catch(() => {});
+
         let /**
              * @type {puppeteer.Browser}
              */
@@ -478,10 +507,12 @@ class Client extends EventEmitter {
 
         browser = null;
         page = null;
+        this._qrRetries = 0;
 
         await this.authStrategy.beforeBrowserInitialized();
 
         const puppeteerOpts = this.options.puppeteer;
+        let userAgent = this.options.userAgent;
         if (
             puppeteerOpts &&
             (puppeteerOpts.browserWSEndpoint || puppeteerOpts.browserURL)
@@ -490,11 +521,28 @@ class Client extends EventEmitter {
             page = await browser.newPage();
         } else {
             const browserArgs = [...(puppeteerOpts.args || [])];
-            if (
-                this.options.userAgent !== false &&
-                !browserArgs.find((arg) => arg.includes('--user-agent'))
-            ) {
-                browserArgs.push(`--user-agent=${this.options.userAgent}`);
+            const userAgentArg = browserArgs.find((arg) =>
+                arg.includes('--user-agent'),
+            );
+            if (userAgent === undefined && userAgentArg) {
+                userAgent =
+                    userAgentArg.split('=').slice(1).join('=') || undefined;
+            }
+            if (userAgent === undefined) {
+                let executablePath = puppeteerOpts.executablePath;
+                try {
+                    executablePath ??= puppeteer.executablePath();
+                } catch (ignoredError) {
+                    // launch() reports a missing browser by itself
+                }
+                const majorVersion =
+                    await Util.getChromeMajorVersion(executablePath);
+                if (majorVersion) {
+                    userAgent = Util.buildUserAgent(majorVersion);
+                }
+            }
+            if (userAgent && !userAgentArg) {
+                browserArgs.push(`--user-agent=${userAgent}`);
             }
             // navigator.webdriver fix
             browserArgs.push('--disable-blink-features=AutomationControlled');
@@ -506,16 +554,24 @@ class Client extends EventEmitter {
             page = (await browser.pages())[0];
         }
 
+        if (userAgent === undefined) {
+            const majorVersion = Util.parseChromeMajorVersion(
+                await browser.version(),
+            );
+            if (majorVersion) userAgent = Util.buildUserAgent(majorVersion);
+        }
+
         if (this.options.proxyAuthentication !== undefined) {
             await page.authenticate(this.options.proxyAuthentication);
         }
-        if (this.options.userAgent !== false) {
-            await page.setUserAgent(this.options.userAgent);
+        if (userAgent) {
+            await page.setUserAgent({ userAgent });
         }
         if (this.options.bypassCSP) await page.setBypassCSP(true);
 
         this.pupBrowser = browser;
         this.pupPage = page;
+        this._watchBrowser(browser, page);
 
         await this.authStrategy.afterBrowserInitialized();
         await this.initWebVersionCache();
@@ -526,7 +582,7 @@ class Client extends EventEmitter {
 
         await page.goto(WhatsWebURL, {
             waitUntil: 'load',
-            timeout: 0,
+            timeout: NAVIGATION_TIMEOUT_MS,
             referer: 'https://whatsapp.com/',
         });
 
@@ -544,24 +600,46 @@ class Client extends EventEmitter {
         this.pupPage.on('framenavigated', async (frame) => {
             if (frame.parentFrame() !== null) return;
 
-            const isLogout =
-                frame.url().includes('post_logout=1') || this.lastLoggedOut;
+            // Puppeteer ignores the promise returned by event listeners, so anything
+            // thrown here would be an unhandled rejection and crash the whole process
+            try {
+                const isLogout =
+                    frame.url().includes('post_logout=1') || this.lastLoggedOut;
 
-            if (isLogout) {
-                this.emit(Events.DISCONNECTED, 'LOGOUT');
-                await this.authStrategy.logout();
-                await this.authStrategy.beforeBrowserInitialized();
-                await this.authStrategy.afterBrowserInitialized();
-                this.lastLoggedOut = false;
+                if (isLogout) {
+                    this.emit(Events.DISCONNECTED, DisconnectReason.LOGOUT);
+                    try {
+                        await this.authStrategy.logout();
+                        await this.authStrategy.beforeBrowserInitialized();
+                        await this.authStrategy.afterBrowserInitialized();
+                    } catch (ignoredError) {
+                        // The page shows a new QR code anyway, so carry on without the cleanup
+                    }
+                    this.lastLoggedOut = false;
+                }
+
+                let storeAvailable;
+                try {
+                    storeAvailable = await this.pupPage.evaluate(() => {
+                        return typeof window.WWebJS !== 'undefined';
+                    });
+                } catch (ignoredError) {
+                    // A newer navigation replaced this document and gets its own event
+                    return;
+                }
+
+                if (!isLogout && storeAvailable) return;
+
+                await this.inject();
+            } catch (ignoredError) {
+                const closing =
+                    !this.pupBrowser?.isConnected() ||
+                    this.pupBrowser === this._closingBrowser;
+                if (closing) return;
+                this._disconnect(DisconnectReason.INJECTION_FAILED).catch(
+                    () => {},
+                );
             }
-
-            const storeAvailable = await this.pupPage.evaluate(() => {
-                return typeof window.WWebJS !== 'undefined';
-            });
-
-            if (!isLogout && storeAvailable) return;
-
-            await this.inject();
         });
     }
 
@@ -582,6 +660,8 @@ class Client extends EventEmitter {
             'onCodeReceivedEvent',
             async (code) => {
                 this.emit(Events.CODE_RECEIVED, code);
+                // Codes keep coming every intervalMs, each one notifying the phone
+                await this._countQrRetry();
                 return code;
             },
         );
@@ -877,38 +957,7 @@ class Client extends EventEmitter {
                  * @param {WAState} state the new connection state
                  */
                 this.emit(Events.STATE_CHANGED, state);
-
-                const ACCEPTED_STATES = [
-                    WAState.CONNECTED,
-                    WAState.OPENING,
-                    WAState.PAIRING,
-                    WAState.TIMEOUT,
-                ];
-
-                if (this.options.takeoverOnConflict) {
-                    ACCEPTED_STATES.push(WAState.CONFLICT);
-
-                    if (state === WAState.CONFLICT) {
-                        setTimeout(() => {
-                            this.pupPage.evaluate(() =>
-                                window
-                                    .require('WAWebSocketModel')
-                                    .Socket.takeover(),
-                            );
-                        }, this.options.takeoverTimeoutMs);
-                    }
-                }
-
-                if (!ACCEPTED_STATES.includes(state)) {
-                    /**
-                     * Emitted when the client has been disconnected
-                     * @event Client#disconnected
-                     * @param {WAState|"LOGOUT"} reason reason that caused the disconnect
-                     */
-                    await this.authStrategy.disconnect();
-                    this.emit(Events.DISCONNECTED, state);
-                    this.destroy();
-                }
+                await this._handleConnectionState(state);
             },
         );
 
@@ -1121,6 +1170,8 @@ class Client extends EventEmitter {
             AppState.on('change:state', (_AppState, state) => {
                 window.onAppStateChangedEvent(state);
             });
+            // From now on this listener reports state changes, not the one set up by inject()
+            window._wwjsStateListenerAttached = true;
             window
                 .require('WAWebConnModel')
                 .Conn.on('change:battery', (state) => {
@@ -1307,24 +1358,35 @@ class Client extends EventEmitter {
         const requestedVersion = this.options.webVersion;
         const versionContent = await webCache.resolve(requestedVersion);
 
+        // These listeners swallow errors because Puppeteer does not handle their
+        // rejections: a request that is already handled or a closing page would crash the process
         if (versionContent) {
             await this.pupPage.setRequestInterception(true);
             this.pupPage.on('request', async (req) => {
-                if (req.url() === WhatsWebURL) {
-                    req.respond({
-                        status: 200,
-                        contentType: 'text/html',
-                        body: versionContent,
-                    });
-                } else {
-                    req.continue();
+                try {
+                    if (req.isInterceptResolutionHandled()) return;
+                    if (req.url() === WhatsWebURL) {
+                        await req.respond({
+                            status: 200,
+                            contentType: 'text/html',
+                            body: versionContent,
+                        });
+                    } else {
+                        await req.continue();
+                    }
+                } catch (ignoredError) {
+                    // Nothing left to resolve
                 }
             });
         } else {
             this.pupPage.on('response', async (res) => {
                 if (res.ok() && res.url() === WhatsWebURL) {
-                    const indexHtml = await res.text();
-                    this.currentIndexHtml = indexHtml;
+                    try {
+                        const indexHtml = await res.text();
+                        this.currentIndexHtml = indexHtml;
+                    } catch (ignoredError) {
+                        // Body no longer available; the version just won't be cached
+                    }
                 }
             });
         }
@@ -1334,10 +1396,21 @@ class Client extends EventEmitter {
      * Closes the client
      */
     async destroy() {
+        // Calls made while a teardown is running (e.g. from a disconnected listener) share it
+        if (!this._destroying) {
+            this._destroying = this._destroy().finally(() => {
+                this._destroying = null;
+            });
+        }
+        return this._destroying;
+    }
+
+    async _destroy() {
         if (this._injectAbort) this._injectAbort.abort();
         this._framenavigatedRegistered = false;
 
         const browser = this.pupBrowser;
+        this._closingBrowser = browser;
         const isConnected = browser?.isConnected?.();
         if (isConnected) {
             await browser.close();
@@ -1346,9 +1419,133 @@ class Client extends EventEmitter {
     }
 
     /**
+     * Reports a crashed or closed browser, which would otherwise leave the client silently unusable
+     * Private function
+     * @param {puppeteer.Browser} browser
+     * @param {puppeteer.Page} page
+     */
+    _watchBrowser(browser, page) {
+        const onLost = (reason) => {
+            if (
+                browser !== this.pupBrowser ||
+                browser === this._closingBrowser
+            ) {
+                return;
+            }
+            // A crash fires several of these events; report it once
+            this._closingBrowser = browser;
+            this._disconnect(reason).catch(() => {});
+        };
+
+        browser.on('disconnected', () =>
+            onLost(DisconnectReason.BROWSER_DISCONNECTED),
+        );
+        page.on('error', () => onLost(DisconnectReason.PAGE_CRASHED));
+        page.on('close', () => onLost(DisconnectReason.PAGE_CRASHED));
+    }
+
+    /**
+     * Reacts to a connection state that keeps the client from working
+     * Private function
+     * @param {WAState} state
+     * @returns {Promise<boolean>} Whether the client disconnected
+     */
+    async _handleConnectionState(state) {
+        const workingStates = [
+            WAState.CONNECTED,
+            WAState.OPENING,
+            WAState.PAIRING,
+            WAState.TIMEOUT,
+        ];
+        if (workingStates.includes(state)) return false;
+
+        if (
+            state === WAState.CONFLICT &&
+            this.options.takeoverOnConflict &&
+            this._allowTakeover()
+        ) {
+            // The page that hit the conflict, not one created by a later re-initialize
+            const page = this.pupPage;
+            setTimeout(() => {
+                page?.evaluate(() =>
+                    window.require('WAWebSocketModel').Socket.takeover(),
+                ).catch(() => {});
+            }, this.options.takeoverTimeoutMs);
+            return false;
+        }
+
+        // Only an unpaired device invalidates the saved session. Wiping it for any
+        // other state (conflict, blocks, outdated version...) would force a new QR
+        // scan where restarting with the same session works.
+        if (state === WAState.UNPAIRED || state === WAState.UNPAIRED_IDLE) {
+            try {
+                await this.authStrategy.disconnect();
+            } catch (ignoredError) {
+                // The client is torn down below either way
+            }
+        }
+
+        await this._disconnect(state);
+        return true;
+    }
+
+    /**
+     * Records a takeover, unless there were too many recently
+     * Private function
+     * @returns {boolean} Whether the takeover may happen
+     */
+    _allowTakeover() {
+        const now = Date.now();
+        this._takeovers = (this._takeovers || []).filter(
+            (time) => now - time < TAKEOVER_WINDOW_MS,
+        );
+        if (this._takeovers.length >= MAX_TAKEOVERS) return false;
+
+        this._takeovers.push(now);
+        return true;
+    }
+
+    /**
+     * Counts a new QR or pairing code and disconnects once qrMaxRetries is exceeded
+     * Private function
+     */
+    async _countQrRetry() {
+        if (this.options.qrMaxRetries > 0) {
+            this._qrRetries++;
+            if (this._qrRetries > this.options.qrMaxRetries) {
+                await this._disconnect(DisconnectReason.MAX_QR_RETRIES);
+            }
+        }
+    }
+
+    /**
+     * Emits `disconnected` and tears the client down
+     * Private function
+     * @param {WAState|DisconnectReason} reason
+     */
+    async _disconnect(reason) {
+        // Already tearing down (a crash, a state change or destroy() itself): report nothing more
+        if (this._destroying) return this._destroying;
+
+        // Start the teardown first, so a listener that re-initializes the client waits for it
+        const destroying = this.destroy();
+        try {
+            /**
+             * Emitted when the client has been disconnected
+             * @event Client#disconnected
+             * @param {WAState|DisconnectReason} reason reason that caused the disconnect
+             */
+            this.emit(Events.DISCONNECTED, reason);
+        } finally {
+            await destroying;
+        }
+    }
+
+    /**
      * Logs out the client, closing the current session
      */
     async logout() {
+        this._closingBrowser = this.pupBrowser;
         await this.pupPage.evaluate(() => {
             return window.require('WAWebSocketModel').Socket.logout();
         });

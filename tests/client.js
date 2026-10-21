@@ -8,7 +8,8 @@ const Contact = require('../src/structures/Contact');
 const Message = require('../src/structures/Message');
 const MessageMedia = require('../src/structures/MessageMedia');
 const Location = require('../src/structures/Location');
-const { MessageTypes, DefaultOptions } = require('../src/util/Constants');
+const { MessageTypes } = require('../src/util/Constants');
+const Util = require('../src/util/Util');
 
 const expect = chai.expect;
 chai.use(chaiAsPromised);
@@ -17,7 +18,10 @@ const remoteId = helper.remoteId;
 
 describe('Client', function () {
     describe('User Agent', function () {
-        it('should set user agent on browser', async function () {
+        const customUA =
+            'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/99.9.9999.999 Safari/537.36';
+
+        it('should set a user agent matching the launched browser', async function () {
             this.timeout(25000);
 
             const client = helper.createClient();
@@ -25,23 +29,23 @@ describe('Client', function () {
 
             await helper.sleep(20000);
 
+            const majorVersion = Util.parseChromeMajorVersion(
+                await client.pupBrowser.version(),
+            );
             const browserUA = await client.pupBrowser.userAgent();
-            expect(browserUA).to.equal(DefaultOptions.userAgent);
+            expect(browserUA).to.equal(Util.buildUserAgent(majorVersion));
+            expect(browserUA).to.not.include('HeadlessChrome');
 
             const pageUA = await client.pupPage.evaluate(
                 () => window.navigator.userAgent,
             );
-            expect(pageUA).to.equal(DefaultOptions.userAgent);
+            expect(pageUA).to.equal(browserUA);
 
             await client.destroy();
         });
 
         it('should set custom user agent on browser', async function () {
             this.timeout(25000);
-            const customUA = DefaultOptions.userAgent.replace(
-                /Chrome\/.* /,
-                'Chrome/99.9.9999.999 ',
-            );
 
             const client = helper.createClient({
                 options: {
@@ -67,11 +71,6 @@ describe('Client', function () {
         it('should respect an existing user agent arg', async function () {
             this.timeout(25000);
 
-            const customUA = DefaultOptions.userAgent.replace(
-                /Chrome\/.* /,
-                'Chrome/99.9.9999.999 ',
-            );
-
             const client = helper.createClient({
                 options: {
                     puppeteer: {
@@ -90,7 +89,7 @@ describe('Client', function () {
             const pageUA = await client.pupPage.evaluate(
                 () => window.navigator.userAgent,
             );
-            expect(pageUA).to.equal(DefaultOptions.userAgent);
+            expect(pageUA).to.equal(customUA);
 
             await client.destroy();
         });

@@ -414,7 +414,7 @@ declare namespace WAWebJS {
             event: 'disconnected',
             listener: (
                 /** reason that caused the disconnect */
-                reason: WAState | 'LOGOUT',
+                reason: WAState | DisconnectReason | 'LOGOUT',
             ) => void,
         ): this;
 
@@ -718,18 +718,19 @@ declare namespace WAWebJS {
         webVersion?: string;
         /**  Determines how to retrieve the WhatsApp Web version specified in options.webVersion. */
         webVersionCache?: WebCacheOptions;
-        /** How many times should the qrcode be refreshed before giving up
+        /** How many times should the qrcode (or pairing code) be refreshed before giving up
          * @default 0 (disabled) */
         qrMaxRetries?: number;
-        /** If another whatsapp web session is detected (another browser), take over the session in the current browser
+        /** If another whatsapp web session is detected (another browser), take over the session in the current browser.
+         * Gives up and disconnects with CONFLICT after 3 takeovers in 10 minutes.
          * @default false */
         takeoverOnConflict?: boolean;
         /** How much time to wait before taking over the session
          * @default 0 */
         takeoverTimeoutMs?: number;
-        /** User agent to use in puppeteer.
-         * @default 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_14_0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/72.0.3626.109 Safari/537.36' */
-        userAgent?: string;
+        /** User agent to use in puppeteer. `false` keeps the browser's own.
+         * @default the one a regular Chrome of the launched version sends on this platform */
+        userAgent?: string | false;
         /** Ffmpeg path to use when formatting videos to webp while sending stickers
          * @default 'ffmpeg' */
         ffmpegPath?: string;
@@ -1127,6 +1128,18 @@ declare namespace WAWebJS {
         UNLAUNCHED = 'UNLAUNCHED',
         UNPAIRED = 'UNPAIRED',
         UNPAIRED_IDLE = 'UNPAIRED_IDLE',
+    }
+
+    /** Reasons, other than a WAState, for which the client emits `disconnected` */
+    export enum DisconnectReason {
+        LOGOUT = 'LOGOUT',
+        MAX_QR_RETRIES = 'Max qrcode retries reached',
+        /** The browser process exited or the connection to it was lost */
+        BROWSER_DISCONNECTED = 'BROWSER_DISCONNECTED',
+        /** The WhatsApp Web tab crashed or was closed */
+        PAGE_CRASHED = 'PAGE_CRASHED',
+        /** WhatsApp Web could not be loaded again after the page reloaded */
+        INJECTION_FAILED = 'INJECTION_FAILED',
     }
 
     export type MessageInfo = {

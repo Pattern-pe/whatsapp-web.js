@@ -3,10 +3,13 @@
 const path = require('path');
 const Crypto = require('crypto');
 const { tmpdir } = require('os');
+const { execFile } = require('child_process');
+const { promisify } = require('util');
 const ffmpeg = require('fluent-ffmpeg');
 const webp = require('node-webpmux');
 const fs = require('fs').promises;
 const has = (o, k) => Object.prototype.hasOwnProperty.call(o, k);
+const execFileAsync = promisify(execFile);
 
 /**
  * Utility methods
@@ -193,6 +196,61 @@ class Util {
      */
     static setFfmpegPath(path) {
         ffmpeg.setFfmpegPath(path);
+    }
+
+    /**
+     * Extracts the major version from a Chrome version string, e.g. "HeadlessChrome/146.0.7680.31"
+     * @param {string} text
+     * @returns {?number}
+     */
+    static parseChromeMajorVersion(text) {
+        const match = /(\d{1,4})\.\d{1,4}\.\d{1,6}\.\d{1,6}/.exec(text || '');
+        return match ? Number(match[1]) : null;
+    }
+
+    /**
+     * Gets the major version of a Chrome executable without launching a browser window
+     * @param {string} executablePath
+     * @returns {Promise<?number>}
+     */
+    static async getChromeMajorVersion(executablePath) {
+        if (!executablePath) return null;
+
+        // Browsers downloaded by Puppeteer live in a directory named after their version
+        const cacheDir = /[-_](\d{1,4}\.\d{1,4}\.\d{1,6}\.\d{1,6})[\\/]/.exec(
+            executablePath,
+        );
+        if (cacheDir) return Util.parseChromeMajorVersion(cacheDir[1]);
+
+        // On Windows `chrome.exe --version` opens a window instead of printing
+        if (process.platform === 'win32') return null;
+
+        try {
+            const { stdout } = await execFileAsync(
+                executablePath,
+                ['--version'],
+                { timeout: 5000 },
+            );
+            return Util.parseChromeMajorVersion(stdout);
+        } catch (ignoredError) {
+            // Unknown version: the caller reads it from the running browser instead
+            return null;
+        }
+    }
+
+    /**
+     * Builds the user agent that a regular (non-headless) Chrome of the given version sends on this platform
+     * @param {number} majorVersion
+     * @returns {string}
+     */
+    static buildUserAgent(majorVersion) {
+        const platforms = {
+            darwin: 'Macintosh; Intel Mac OS X 10_15_7',
+            win32: 'Windows NT 10.0; Win64; x64',
+        };
+        const platform = platforms[process.platform] || 'X11; Linux x86_64';
+
+        return `Mozilla/5.0 (${platform}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${majorVersion}.0.0.0 Safari/537.36`;
     }
 }
 

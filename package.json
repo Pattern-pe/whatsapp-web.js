@@ -7,6 +7,7 @@
     "scripts": {
         "test": "mocha tests --recursive --timeout 5000",
         "test-single": "mocha",
+        "test:unit": "mocha tests/unit --recursive",
         "shell": "node --experimental-repl-await ./shell.js",
         "generate-docs": "npx jsdoc --configure .jsdoc.json --verbose",
         "lint": "eslint .",
